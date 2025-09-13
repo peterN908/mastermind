@@ -1,0 +1,19 @@
+[project]
+name = "mastermind"
+description = "Single-turn Mastermind environment with information-gain / elimination scoring"
+tags = ["mastermind", "games", "single-turn", "eval"]
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "verifiers>=0.1.3.post0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build]
+include = ["mastermind.py", "mastermind_cli.py"]
+
+[project.scripts]
+mastermind-play = "mastermind_cli:main"
