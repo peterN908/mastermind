@@ -873,11 +873,45 @@ def load_environment(**kwargs) -> vf.Environment:
                 if not ok:
                     val = -1.0
                 else:
-                    cfg_local = MastermindConfig(
-                        L=L, K=K, allow_repeats=repeats, reward_mode=reward_mode,
-                        max_space_enum=max_space_enum, sample_n=sample_n, history_len=0,
-                    )
-                    val, _ = _compute_reward_for_guess(guess, cfg_local, history, rng=random.Random(43))
+                    # Handle ig_relative explicitly to avoid Unknown reward_mode errors
+                    if reward_mode in ("ig_relative", "relative_ig", "ig_rel"):
+                        rng_local = random.Random(43)
+                        cfg_local = MastermindConfig(
+                            L=L, K=K, allow_repeats=repeats, reward_mode="ig",
+                            max_space_enum=max_space_enum, sample_n=sample_n, history_len=0,
+                        )
+                        # Build and cap S_H
+                        S_full, _ = _build_consistent_set(cfg_local, history, rng=rng_local)
+                        if not S_full:
+                            val = 0.0
+                        else:
+                            if relative_sh_cap and len(S_full) > int(relative_sh_cap):
+                                S_H = rng_local.sample(S_full, int(relative_sh_cap))
+                            else:
+                                S_H = S_full
+                            total = len(S_H)
+                            # IG for the model guess
+                            counts_g = _partition_counts(S_H, guess)
+                            ig_g = _reward_from_counts(counts_g, total, mode="ig")
+                            # Candidate pool (consistent only for logging)
+                            cand_full = S_H
+                            if relative_candidate_cap and len(cand_full) > int(relative_candidate_cap):
+                                candidates = rng_local.sample(cand_full, int(relative_candidate_cap))
+                            else:
+                                candidates = cand_full
+                            best = 0.0
+                            for g in candidates:
+                                cts = _partition_counts(S_H, g)
+                                val_ = _reward_from_counts(cts, total, mode="ig")
+                                if val_ > best:
+                                    best = val_
+                            val = float(ig_g / best) if best > 0 else 0.0
+                    else:
+                        cfg_local = MastermindConfig(
+                            L=L, K=K, allow_repeats=repeats, reward_mode=reward_mode,
+                            max_space_enum=max_space_enum, sample_n=sample_n, history_len=0,
+                        )
+                        val, _ = _compute_reward_for_guess(guess, cfg_local, history, rng=random.Random(43))
                 log_path = str(info.get("curriculum_log", cur_log_path))
                 run_id = str(info.get("curriculum_run_id", curriculum_run_id or ""))
                 try:
