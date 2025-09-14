@@ -17,6 +17,9 @@ import os
 import statistics
 from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple
+from pathlib import Path
+from datetime import datetime
+import uuid
 
 from openai import OpenAI
 import verifiers as vf
@@ -88,7 +91,8 @@ def adjust_difficulty(d: Difficulty, avg_reward: float, low: float, high: float,
     return new
 
 
-def evaluate_epoch(mm, model: str, client: OpenAI, d: Difficulty, n: int, r: int, toks: int, temp: float, seed: int | None) -> Tuple[float, Dict[str, float]]:
+def evaluate_epoch(mm, model: str, client: OpenAI, d: Difficulty, n: int, r: int, toks: int, temp: float, seed: int | None,
+                   return_results: bool = False):
     env_args = d.to_env_args()
     if seed is not None:
         env_args["seed"] = seed
@@ -111,7 +115,49 @@ def evaluate_epoch(mm, model: str, client: OpenAI, d: Difficulty, n: int, r: int
         vals = (results.metrics.get(key) or [])
         if vals:
             metrics[f"avg_{key}"] = float(statistics.fmean(vals))
+    if return_results:
+        return avg, metrics, results
     return avg, metrics
+
+
+def _save_generate_outputs(results: vf.GenerateOutputs, out_dir: Path, extra_meta: Dict[str, Any] | None = None) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    # results.jsonl
+    n = len(results.reward)
+    metric_keys = list(results.metrics.keys()) if results.metrics else []
+    results_path = out_dir / "results.jsonl"
+    with results_path.open("w", encoding="utf-8") as f:
+        for i in range(n):
+            rec = {
+                "prompt": results.prompt[i],
+                "completion": results.completion[i],
+                "answer": results.answer[i] if i < len(results.answer) else "",
+                "task": results.task[i] if hasattr(results, "task") and i < len(results.task) else "",
+                "info": results.info[i] if hasattr(results, "info") and i < len(results.info) else {},
+                "reward": results.reward[i],
+            }
+            for k in metric_keys:
+                try:
+                    rec[k] = results.metrics[k][i]
+                except Exception:
+                    pass
+            f.write(json.dumps(rec) + "\n")
+    # metadata.json
+    meta = {
+        "date": datetime.now().strftime("%Y-%m-%d"),
+        "time": datetime.now().strftime("%H:%M:%S"),
+        "avg_reward": (sum(results.reward) / len(results.reward)) if results.reward else 0.0,
+    }
+    if extra_meta:
+        meta.update(extra_meta)
+    for k in metric_keys:
+        try:
+            vals = results.metrics[k]
+            meta[f"avg_{k}"] = sum(vals) / len(vals) if vals else 0.0
+        except Exception:
+            pass
+    with (out_dir / "metadata.json").open("w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2)
 
 
 def main(argv: List[str] | None = None) -> int:
@@ -132,6 +178,11 @@ def main(argv: List[str] | None = None) -> int:
     ap.add_argument("--H-min", type=int, default=1)
     ap.add_argument("--H-max", type=int, default=3)
     ap.add_argument("--log", type=str, default="environments/mastermind/outputs/training/curriculum.jsonl")
+    ap.add_argument("--save-details", action="store_true", help="Save per-epoch single-turn outputs to JSONL")
+    ap.add_argument("--details-dir", type=str, default="environments/mastermind/outputs/training/details", help="Directory for saved outputs")
+    ap.add_argument("--val-every", type=int, default=10, help="Run solve-mode validation every N epochs (0 to disable)")
+    ap.add_argument("--val-num", type=int, default=5, help="Validation examples (solve mode)")
+    ap.add_argument("--val-max-turns", type=int, default=12, help="Solve-mode max turns for validation")
     args = ap.parse_args(argv)
 
     # Model client
@@ -151,7 +202,18 @@ def main(argv: List[str] | None = None) -> int:
 
     d = Difficulty(L=4, K=6, history_len=0)
     for epoch in range(1, args.epochs + 1):
-        avg, metrics = evaluate_epoch(mm, args.model, client, d, args.num_examples, args.repeats, args.max_tokens, args.temperature, args.seed)
+        avg, metrics, results = evaluate_epoch(mm, args.model, client, d, args.num_examples, args.repeats, args.max_tokens, args.temperature, args.seed, return_results=True)
+        # Optional: save per-epoch single-turn outputs
+        if args.save_details:
+            out_dir = Path(args.details_dir) / f"single_epoch_{epoch:03d}"
+            _save_generate_outputs(results, out_dir, extra_meta={
+                "env": "mastermind",
+                "mode": "single",
+                "L": d.L, "K": d.K, "history_len": d.history_len,
+                "num_examples": args.num_examples,
+                "rollouts_per_example": args.repeats,
+                "sampling_args": {"max_tokens": args.max_tokens, "temperature": args.temperature},
+            })
         rec = {
             "epoch": epoch,
             "L": d.L,
@@ -163,6 +225,31 @@ def main(argv: List[str] | None = None) -> int:
         log_f.write(json.dumps(rec) + "\n")
         log_f.flush()
         print(f"Epoch {epoch:03d} | L={d.L} K={d.K} H={d.history_len} | avg_reward={avg:.4f}")
+
+        # Periodic validation in solve mode
+        if args.val_every > 0 and (epoch % args.val_every == 0):
+            val_env = mm.load_environment(env_args={
+                "mode": "solve",
+                "solve_max_turns": int(args.val_max_turns),
+                "max_examples": int(args.val_num),
+            })
+            val_results = val_env.evaluate(
+                client=client,
+                model=args.model,
+                num_examples=int(args.val_num),
+                rollouts_per_example=1,
+                sampling_args={"max_tokens": args.max_tokens, "temperature": args.temperature},
+            )
+            val_dir = Path(args.details_dir) / f"val_epoch_{epoch:03d}"
+            _save_generate_outputs(val_results, val_dir, extra_meta={
+                "env": "mastermind",
+                "mode": "solve",
+                "solve_max_turns": int(args.val_max_turns),
+                "num_examples": int(args.val_num),
+                "rollouts_per_example": 1,
+                "sampling_args": {"max_tokens": args.max_tokens, "temperature": args.temperature},
+            })
+            print(f"[val] Saved solve-mode validation to {val_dir}")
         # adjust difficulty for next epoch
         d = adjust_difficulty(
             d, avg, args.low, args.high,
@@ -175,4 +262,3 @@ def main(argv: List[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
