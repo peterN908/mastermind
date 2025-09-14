@@ -19,6 +19,7 @@ def _load_mastermind_symbols():
             _render_prompt_text,
             _parse_guess_from_text,
             _compute_reward_for_guess,
+            suggest_best_guesses,
             _generate_random_history,
         )
         return {
@@ -26,6 +27,7 @@ def _load_mastermind_symbols():
             "_render_prompt_text": _render_prompt_text,
             "_parse_guess_from_text": _parse_guess_from_text,
             "_compute_reward_for_guess": _compute_reward_for_guess,
+            "suggest_best_guesses": suggest_best_guesses,
             "_generate_random_history": _generate_random_history,
         }
     except Exception:
@@ -43,6 +45,7 @@ def _load_mastermind_symbols():
             "_render_prompt_text": mm._render_prompt_text,
             "_parse_guess_from_text": mm._parse_guess_from_text,
             "_compute_reward_for_guess": mm._compute_reward_for_guess,
+            "suggest_best_guesses": mm.suggest_best_guesses,
             "_generate_random_history": mm._generate_random_history,
         }
 
@@ -53,6 +56,7 @@ def main(argv: List[str] | None = None) -> int:
     _render_prompt_text = syms["_render_prompt_text"]
     _parse_guess_from_text = syms["_parse_guess_from_text"]
     _compute_reward_for_guess = syms["_compute_reward_for_guess"]
+    suggest_best_guesses = syms["suggest_best_guesses"]
     _generate_random_history = syms["_generate_random_history"]
 
     p = argparse.ArgumentParser(
@@ -77,7 +81,7 @@ def main(argv: List[str] | None = None) -> int:
         "--reward-mode",
         choices=["elim", "ig"],
         default="ig",
-        help="Reward mode: information gain (bits) or elimination (Gini)",
+        help="Reward mode for suggestions/scoring: information gain (bits) or elimination (Gini). Note: env default is ig_relative for single-turn, which ranks equivalent to ig.",
     )
     p.add_argument(
         "--max-space-enum",
@@ -92,6 +96,13 @@ def main(argv: List[str] | None = None) -> int:
         help="Sample size when approximating large spaces",
     )
     p.add_argument("--history-len", type=int, default=0, help="Random history length")
+    p.add_argument("--suggest-top", type=int, default=0, help="If >0, print top-K suggested guesses before prompting")
+    p.add_argument(
+        "--candidate-pool",
+        choices=["consistent", "all"],
+        default="consistent",
+        help="Candidate pool for suggestions",
+    )
     p.add_argument(
         "--history",
         type=str,
@@ -130,6 +141,22 @@ def main(argv: List[str] | None = None) -> int:
     # Render prompt and instructions
     prompt = _render_prompt_text(cfg.L, cfg.K, cfg.allow_repeats, history)
     print("\n" + prompt + "\n")
+    if args.suggest_top and args.suggest_top > 0:
+        try:
+            top = suggest_best_guesses(
+                cfg,
+                history,
+                top_k=int(args.suggest_top),
+                candidate_pool=str(args.candidate_pool),
+                rng=rng,
+            )
+            if top:
+                print("Top suggestions:")
+                for i, (g, sc) in enumerate(top, 1):
+                    print(f"  {i}. {' '.join(map(str, g))}  score={sc:.4f}")
+                print("")
+        except Exception as e:
+            print(f"[warn] suggestion failed: {e}")
     print("Enter your guess. You can type either:")
     print("  - GUESS: a b c d")
     print("  - a b c d (we will wrap it for you)\n")

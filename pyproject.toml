@@ -17,3 +17,4 @@ include = ["mastermind.py", "mastermind_cli.py"]
 
 [project.scripts]
 mastermind-play = "mastermind_cli:main"
+mastermind-train-curriculum = "mastermind_curriculum_train:main"

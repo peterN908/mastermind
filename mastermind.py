@@ -1,9 +1,11 @@
 import math
+import os
+import time
 import random
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Sequence, Tuple, Optional
 
 import verifiers as vf
 
@@ -132,6 +134,66 @@ def _reward_from_counts(counts: Dict[Feedback, int], total: int, mode: str = "el
         raise ValueError(f"Unknown reward_mode: {mode}")
 
 
+def _build_consistent_set(
+    cfg: "MastermindConfig",
+    history: List[Tuple[List[int], Feedback]],
+    rng: random.Random,
+) -> Tuple[List[Tuple[int, ...]], bool]:
+    """Build consistent codes S_H (enumerate or sample) and return (S_H, used_sampling)."""
+    space_size = cfg.K ** cfg.L
+    used_sampling = False
+    if space_size <= cfg.max_space_enum:
+        universe = _all_codes_enumerate(cfg.L, cfg.K, cfg.allow_repeats)
+    else:
+        used_sampling = True
+        universe = _sample_codes(cfg.L, cfg.K, cfg.allow_repeats, n=max(1000, cfg.sample_n), rng=rng)
+    consistent = _filter_by_history(universe, history)
+    return consistent, used_sampling
+
+
+def suggest_best_guesses(
+    cfg: "MastermindConfig",
+    history: List[Tuple[List[int], Feedback]],
+    top_k: int = 5,
+    candidate_pool: str = "consistent",  # "consistent" | "all"
+    rng: random.Random | None = None,
+) -> List[Tuple[List[int], float]]:
+    """Return top_k guesses by reward (cfg.reward_mode) given history.
+
+    For small spaces, evaluates either the consistent set (default) or all codes as candidate guesses.
+    For large spaces, both S_H and candidate pool are sampled per cfg.sample_n.
+    """
+    r = rng or random.Random(42)
+    S_H, used_sampling = _build_consistent_set(cfg, history, r)
+    total = len(S_H)
+    if total == 0:
+        return []
+
+    # Build candidate pool
+    if candidate_pool == "consistent":
+        candidates = S_H
+    elif candidate_pool == "all":
+        space_size = cfg.K ** cfg.L
+        if space_size <= cfg.max_space_enum:
+            candidates = _all_codes_enumerate(cfg.L, cfg.K, cfg.allow_repeats)
+        else:
+            candidates = _sample_codes(cfg.L, cfg.K, cfg.allow_repeats, n=max(1000, cfg.sample_n), rng=r)
+    else:
+        raise ValueError("candidate_pool must be 'consistent' or 'all'")
+
+    # Use IG for ranking if reward_mode is relative variants (denominator is constant across candidates)
+    rank_mode = cfg.reward_mode
+    if rank_mode in ("ig_relative", "relative_ig", "ig_rel"):
+        rank_mode = "ig"
+    scored: List[Tuple[List[int], float]] = []
+    for g in candidates:
+        counts = _partition_counts(S_H, g)
+        score = _reward_from_counts(counts, total, mode=rank_mode)
+        scored.append((list(g), float(score)))
+    scored.sort(key=lambda x: (-x[1], x[0]))
+    return scored[: max(1, int(top_k))]
+
+
 # -------------------------------
 # Prompt and parsing helpers
 # -------------------------------
@@ -148,7 +210,12 @@ def _render_prompt_text(L: int, K: int, repeats: bool, history: List[Tuple[List[
             g_str = " ".join(str(x) for x in g)
             lines.append(f"- Guess {g_str} -> feedback b={b}, w={w}")
     lines.append(f"CONSTRAINTS: repeats {'allowed' if repeats else 'not allowed'}")
-    lines.append("ACTION FORMAT: Put the guess inside <answer>...</answer> exactly as 'GUESS: a b c d'.")
+    # Build an example pattern with exactly L placeholders (a b c ...)
+    placeholders = " ".join(chr(ord('a') + i) for i in range(L))
+    lines.append(
+        "ACTION FORMAT: Put the guess inside <answer>...</answer> exactly as 'GUESS: "
+        + placeholders + "'."
+    )
     return "\n".join(lines)
 
 
@@ -206,7 +273,7 @@ class MastermindConfig:
     L: int = 4
     K: int = 6
     allow_repeats: bool = True
-    reward_mode: str = "ig"  # "elim" or "ig"
+    reward_mode: str = "ig_relative"  # "ig_relative", "ig", or "elim"
     max_space_enum: int = 200_000
     sample_n: int = 10_000  # used when space is too large
     history_len: int = 0
@@ -294,7 +361,7 @@ def load_environment(**kwargs) -> vf.Environment:
       - L: int = 4
       - K: int = 6
       - allow_repeats: bool = True
-      - reward_mode: str = "ig" | "elim"  # default ig
+      - reward_mode: str = "ig_relative" | "ig" | "elim"  # default ig_relative
       - max_space_enum: int = 200000
       - sample_n: int = 10000
       - history_len: int = 0
@@ -303,6 +370,11 @@ def load_environment(**kwargs) -> vf.Environment:
       - use_think: bool = True (formatting only)
       - mode: str = "single" | "solve"  # single-turn scoring vs. multi-turn solve-to-completion
       - solve_max_turns: int = 12        # cap for multi-turn mode
+      - relative_pool: str = "consistent" | "all"  # candidate pool for ig_relative
+      - relative_sh_cap: int = 5000      # sample cap for S_H when computing ig_relative
+      - relative_candidate_cap: int = 1000  # sample cap for candidate guesses when computing ig_relative
+      - curriculum: bool | dict = False  # default disabled; enable to adapt difficulty across runs
+        # when dict, accepts keys: low, high, L_min, L_max, K_min, K_max, H_min, H_max, log_path
       - fixed_history: list[[guess:list[int], feedback:[b,w]]] | None
     """
     # Support being called with either env_args dict or flattened kwargs
@@ -312,7 +384,7 @@ def load_environment(**kwargs) -> vf.Environment:
         L=int(env_args.get("L", 4)),
         K=int(env_args.get("K", 6)),
         allow_repeats=bool(env_args.get("allow_repeats", True)),
-        reward_mode=str(env_args.get("reward_mode", "ig")),
+        reward_mode=str(env_args.get("reward_mode", "ig_relative")),
         max_space_enum=int(env_args.get("max_space_enum", 200_000)),
         sample_n=int(env_args.get("sample_n", 10_000)),
         history_len=int(env_args.get("history_len", 0)),
@@ -325,12 +397,124 @@ def load_environment(**kwargs) -> vf.Environment:
     mode: str = str(env_args.get("mode", "solve")).lower()
     solve_max_turns: int = int(env_args.get("solve_max_turns", 12))
     rng = random.Random(cfg.seed)
+    relative_pool: str = str(env_args.get("relative_pool", "consistent"))
+    relative_sh_cap: int = int(env_args.get("relative_sh_cap", 5000))
+    relative_candidate_cap: int = int(env_args.get("relative_candidate_cap", 1000))
+    curriculum_cfg = env_args.get("curriculum", False)
+    curriculum_enabled = bool(curriculum_cfg)
+    # curriculum params and modes
+    cur_low = 0.6
+    cur_high = 0.8
+    bounds = {"L_min": 3, "L_max": 8, "K_min": 4, "K_max": 10, "H_min": 0, "H_max": 3}
+    cur_log_path = os.path.join("environments", "mastermind", "outputs", "training", "curriculum.jsonl")
+    cur_mode = "classic"  # classic (uniform adjust), random (per-example random), adaptive (vary L by reward; K/H random)
+    k_equals_l_plus_2 = False
+    if isinstance(curriculum_cfg, dict):
+        cur_low = float(curriculum_cfg.get("low", cur_low))
+        cur_high = float(curriculum_cfg.get("high", cur_high))
+        for k in list(bounds.keys()):
+            if k in curriculum_cfg:
+                bounds[k] = int(curriculum_cfg[k])
+        if curriculum_cfg.get("log_path"):
+            cur_log_path = str(curriculum_cfg["log_path"])
+        cur_mode = str(curriculum_cfg.get("mode", cur_mode)).lower()
+        k_equals_l_plus_2 = bool(curriculum_cfg.get("k_equals_l_plus_2", False))
+
+    def _adjust_difficulty(L: int, K: int, H: int, avg: float) -> tuple[int, int, int]:
+        L_min, L_max = bounds["L_min"], bounds["L_max"]
+        K_min, K_max = bounds["K_min"], bounds["K_max"]
+        H_min, H_max = bounds["H_min"], bounds["H_max"]
+        if avg is None:
+            return L, K, H
+        if avg > cur_high:
+            if L < L_max:
+                return L + 1, K, H
+            if K < K_max:
+                return L, min(K_max, K + 2), H
+            if H < H_max:
+                return L, K, H + 1
+            return L, K, H
+        if avg < cur_low:
+            if H > H_min:
+                return L, K, H - 1
+            if K > K_min:
+                return L, max(K_min, K - 2), H
+            if L > L_min:
+                return L - 1, K, H
+            return L, K, H
+        return L, K, H
+
+    def _curriculum_read_last_avg(log_path: str) -> tuple[Optional[float], Optional[str]]:
+        try:
+            if not os.path.exists(log_path):
+                return None, None
+            last_start_idx = -1
+            run_id = None
+            lines: List[str] = []
+            with open(log_path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+            for i in range(len(lines) - 1, -1, -1):
+                try:
+                    obj = json.loads(lines[i])
+                except Exception:
+                    continue
+                if obj.get("type") == "start":
+                    last_start_idx = i
+                    run_id = obj.get("run_id")
+                    break
+            if last_start_idx == -1 or run_id is None:
+                return None, None
+            vals = []
+            for j in range(last_start_idx + 1, len(lines)):
+                try:
+                    obj = json.loads(lines[j])
+                except Exception:
+                    continue
+                if obj.get("type") == "start":
+                    break
+                if obj.get("type") == "reward" and obj.get("run_id") == run_id:
+                    v = obj.get("reward")
+                    if isinstance(v, (int, float)):
+                        vals.append(float(v))
+            if not vals:
+                return None, run_id
+            return float(sum(vals) / len(vals)), run_id
+        except Exception:
+            return None, None
+
+    # curriculum: if enabled and single-turn, adjust difficulty based on last run log
+    curriculum_run_id = None
+    if curriculum_enabled and mode == "single":
+        try:
+            os.makedirs(os.path.dirname(cur_log_path), exist_ok=True)
+        except Exception:
+            pass
+        last_avg, last_run_id = _curriculum_read_last_avg(cur_log_path)
+        newL, newK, newH = _adjust_difficulty(cfg.L, cfg.K, cfg.history_len, last_avg if last_avg is not None else cfg.history_len * 0.0 + 0.0)
+        cfg.L, cfg.K, cfg.history_len = int(newL), int(newK), int(newH)
+        # allocate a new run id and write start marker
+        curriculum_run_id = f"run-{int(time.time())}-{random.randrange(1<<30):08x}"
+        try:
+            with open(cur_log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "type": "start",
+                    "ts": time.time(),
+                    "run_id": curriculum_run_id,
+                    "L": cfg.L,
+                    "K": cfg.K,
+                    "history_len": cfg.history_len,
+                    "low": cur_low,
+                    "high": cur_high,
+                }) + "\n")
+        except Exception:
+            pass
 
     # Build dataset examples
     examples: List[Dict[str, Any]] = []
     fixed_history = env_args.get("history") or env_args.get("fixed_history")
     if mode == "single":
-        if fixed_history is not None:
+        # --- Single-turn dataset building ---
+        if fixed_history is not None and not curriculum_enabled:
             # accept a single provided history and use it for all examples
             # normalize: list of {"guess":[...], "feedback":[b,w]}
             H: List[Tuple[List[int], Feedback]] = []
@@ -347,6 +531,10 @@ def load_environment(**kwargs) -> vf.Environment:
                 "max_space_enum": cfg.max_space_enum,
                 "sample_n": cfg.sample_n,
                 "history": H,
+                "relative_pool": relative_pool,
+                "curriculum": curriculum_enabled,
+                "curriculum_log": cur_log_path if curriculum_enabled else "",
+                "curriculum_run_id": curriculum_run_id or "",
             }
             for _ in range(max_examples if max_examples > 0 else 1):
                 examples.append({
@@ -356,22 +544,124 @@ def load_environment(**kwargs) -> vf.Environment:
                 })
         else:
             total = max_examples if max_examples and max_examples > 0 else 200
-            for _ in range(total):
-                H = _generate_random_history(cfg, rng)
-                prompt_text = _render_prompt_text(cfg.L, cfg.K, cfg.allow_repeats, H)
-                examples.append({
-                    "question": prompt_text,
-                    "answer": "",
-                    "info": {
-                        "L": cfg.L,
-                        "K": cfg.K,
-                        "allow_repeats": cfg.allow_repeats,
-                        "reward_mode": cfg.reward_mode,
-                        "max_space_enum": cfg.max_space_enum,
-                        "sample_n": cfg.sample_n,
-                        "history": H,
-                    },
-                })
+
+            if not curriculum_enabled or cur_mode == "classic":
+                # classic: maybe adjusted global cfg (if enabled), same L/K/H across examples
+                for _ in range(total):
+                    H_hist = _generate_random_history(cfg, rng)
+                    prompt_text = _render_prompt_text(cfg.L, cfg.K, cfg.allow_repeats, H_hist)
+                    examples.append({
+                        "question": prompt_text,
+                        "answer": "",
+                        "info": {
+                            "L": cfg.L,
+                            "K": cfg.K,
+                            "allow_repeats": cfg.allow_repeats,
+                            "reward_mode": cfg.reward_mode,
+                            "max_space_enum": cfg.max_space_enum,
+                            "sample_n": cfg.sample_n,
+                            "history": H_hist,
+                            "relative_pool": relative_pool,
+                            "curriculum": curriculum_enabled,
+                            "curriculum_mode": cur_mode if curriculum_enabled else "",
+                            "curriculum_log": cur_log_path if curriculum_enabled else "",
+                            "curriculum_run_id": curriculum_run_id or "",
+                        },
+                    })
+
+            elif cur_mode == "random":
+                # per-example random L/K/H within bounds; optional K=L+2
+                for _ in range(total):
+                    L_ex = rng.randint(bounds["L_min"], bounds["L_max"])
+                    if k_equals_l_plus_2:
+                        K_ex = max(bounds["K_min"], min(bounds["K_max"], L_ex + 2))
+                    else:
+                        K_ex = rng.randint(bounds["K_min"], bounds["K_max"])
+                    H_len = rng.randint(bounds["H_min"], bounds["H_max"])
+                    cfg_ex = MastermindConfig(
+                        L=L_ex, K=K_ex, allow_repeats=cfg.allow_repeats, reward_mode=cfg.reward_mode,
+                        max_space_enum=cfg.max_space_enum, sample_n=cfg.sample_n, history_len=H_len,
+                    )
+                    H_hist = _generate_random_history(cfg_ex, rng)
+                    prompt_text = _render_prompt_text(L_ex, K_ex, cfg.allow_repeats, H_hist)
+                    examples.append({
+                        "question": prompt_text,
+                        "answer": "",
+                        "info": {
+                            "L": L_ex,
+                            "K": K_ex,
+                            "allow_repeats": cfg.allow_repeats,
+                            "reward_mode": cfg.reward_mode,
+                            "max_space_enum": cfg.max_space_enum,
+                            "sample_n": cfg.sample_n,
+                            "history": H_hist,
+                            "relative_pool": relative_pool,
+                            "curriculum": curriculum_enabled,
+                            "curriculum_mode": cur_mode,
+                            "k_equals_l_plus_2": k_equals_l_plus_2,
+                            "curriculum_log": cur_log_path,
+                            "curriculum_run_id": curriculum_run_id or "",
+                        },
+                    })
+
+            elif cur_mode == "adaptive":
+                # vary L based on last avg; K and H random within bounds; optional K=L+2
+                # Determine adapted L once per run (from cfg.L as baseline already adjusted above)
+                L_adapt = cfg.L
+                for _ in range(total):
+                    if k_equals_l_plus_2:
+                        K_ex = max(bounds["K_min"], min(bounds["K_max"], L_adapt + 2))
+                    else:
+                        K_ex = rng.randint(bounds["K_min"], bounds["K_max"])
+                    H_len = rng.randint(bounds["H_min"], bounds["H_max"])
+                    cfg_ex = MastermindConfig(
+                        L=L_adapt, K=K_ex, allow_repeats=cfg.allow_repeats, reward_mode=cfg.reward_mode,
+                        max_space_enum=cfg.max_space_enum, sample_n=cfg.sample_n, history_len=H_len,
+                    )
+                    H_hist = _generate_random_history(cfg_ex, rng)
+                    prompt_text = _render_prompt_text(L_adapt, K_ex, cfg.allow_repeats, H_hist)
+                    examples.append({
+                        "question": prompt_text,
+                        "answer": "",
+                        "info": {
+                            "L": L_adapt,
+                            "K": K_ex,
+                            "allow_repeats": cfg.allow_repeats,
+                            "reward_mode": cfg.reward_mode,
+                            "max_space_enum": cfg.max_space_enum,
+                            "sample_n": cfg.sample_n,
+                            "history": H_hist,
+                            "relative_pool": relative_pool,
+                            "curriculum": curriculum_enabled,
+                            "curriculum_mode": cur_mode,
+                            "k_equals_l_plus_2": k_equals_l_plus_2,
+                            "curriculum_log": cur_log_path,
+                            "curriculum_run_id": curriculum_run_id or "",
+                        },
+                    })
+            else:
+                # fallback to classic behavior
+                for _ in range(total):
+                    H_hist = _generate_random_history(cfg, rng)
+                    prompt_text = _render_prompt_text(cfg.L, cfg.K, cfg.allow_repeats, H_hist)
+                    examples.append({
+                        "question": prompt_text,
+                        "answer": "",
+                        "info": {
+                            "L": cfg.L,
+                            "K": cfg.K,
+                            "allow_repeats": cfg.allow_repeats,
+                            "reward_mode": cfg.reward_mode,
+                            "max_space_enum": cfg.max_space_enum,
+                            "sample_n": cfg.sample_n,
+                            "history": H_hist,
+                            "relative_pool": relative_pool,
+                            "curriculum": curriculum_enabled,
+                            "curriculum_mode": cur_mode,
+                            "curriculum_log": cur_log_path,
+                            "curriculum_run_id": curriculum_run_id or "",
+                        },
+                    })
     else:  # mode == "solve": multi-turn solve-to-completion dataset
         total = max_examples if max_examples and max_examples > 0 else 200
         for i in range(total):
@@ -406,8 +696,11 @@ def load_environment(**kwargs) -> vf.Environment:
         # However, most installations include datasets. We'll still pass the list here.
         dataset = examples  # type: ignore
 
-    # Parser: require <answer>GUESS: a b c d</answer>
-    parser = vf.XMLParser(fields=["answer"], answer_field="answer")
+    # Parser: require <answer>GUESS: ...</answer>; when use_think=True also accept <think>...</think>
+    if use_think:
+        parser = vf.XMLParser(fields=["think", "answer"], answer_field="answer")
+    else:
+        parser = vf.XMLParser(fields=["answer"], answer_field="answer")
 
     # System prompt
     if mode == "single":
@@ -446,6 +739,7 @@ def load_environment(**kwargs) -> vf.Environment:
             max_space_enum = int(info.get("max_space_enum", 200_000))
             sample_n = int(info.get("sample_n", 10_000))
             history_raw = info.get("history", [])
+            relative_pool_info = str(info.get("relative_pool", "consistent"))
             history = [
                 (list(item[0]) if not isinstance(item, dict) else list(item["guess"]),
                  (int(item[1][0]) if not isinstance(item, dict) else int(item["feedback"][0]),
@@ -466,8 +760,47 @@ def load_environment(**kwargs) -> vf.Environment:
                 sample_n=sample_n,
                 history_len=0,
             )
-            reward, _ = _compute_reward_for_guess(guess, cfg_local, history, rng=random.Random(42))
-            return float(reward)
+            if reward_mode in ("ig_relative", "relative_ig", "ig_rel"):
+                # Build consistent set once; cap to avoid O(|S_H|^2) work
+                rng_local = random.Random(42)
+                S_H_full, _ = _build_consistent_set(cfg_local, history, rng=rng_local)
+                if len(S_H_full) == 0:
+                    return 0.0
+                if relative_sh_cap and len(S_H_full) > int(relative_sh_cap):
+                    S_H = rng_local.sample(S_H_full, int(relative_sh_cap))
+                else:
+                    S_H = S_H_full
+                total = len(S_H)
+                if total == 0:
+                    return 0.0
+                # IG for this guess
+                counts_g = _partition_counts(S_H, guess)
+                ig_g = _reward_from_counts(counts_g, total, mode="ig")
+                # Candidate pool
+                if relative_pool_info == "consistent":
+                    candidates_full = S_H
+                else:
+                    space_size = K ** L
+                    if space_size <= cfg_local.max_space_enum:
+                        candidates_full = _all_codes_enumerate(L, K, repeats)
+                    else:
+                        candidates_full = _sample_codes(L, K, repeats, n=max(1000, int(cfg_local.sample_n)), rng=random.Random(123))
+                # Cap candidate list size
+                if relative_candidate_cap and len(candidates_full) > int(relative_candidate_cap):
+                    candidates = rng_local.sample(candidates_full, int(relative_candidate_cap))
+                else:
+                    candidates = candidates_full
+                # Best IG among candidates
+                best = 0.0
+                for g in candidates:
+                    cts = _partition_counts(S_H, g)
+                    val = _reward_from_counts(cts, total, mode="ig")
+                    if val > best:
+                        best = val
+                return float(ig_g / best) if best > 0 else 0.0
+            else:
+                reward, _ = _compute_reward_for_guess(guess, cfg_local, history, rng=random.Random(42))
+                return float(reward)
 
         rubric = vf.Rubric(parser=parser)
         rubric.add_reward_func(mastermind_reward, weight=1.0)
@@ -515,6 +848,52 @@ def load_environment(**kwargs) -> vf.Environment:
             return float(len(consistent))
 
         rubric.add_reward_func(sh_size_metric, weight=0.0)
+
+        # Curriculum logger: append reward per rollout to log (weight 0)
+        if curriculum_enabled:
+            async def curriculum_log_reward(parser, completion, info: Dict[str, Any], **_):  # type: ignore
+                try:
+                    ans_text = (parser.parse_answer(completion) or "").strip()
+                except Exception:
+                    ans_text = ""
+                L = int(info.get("L", 4))
+                K = int(info.get("K", 6))
+                repeats = bool(info.get("allow_repeats", True))
+                reward_mode = str(info.get("reward_mode", cfg.reward_mode))
+                max_space_enum = int(info.get("max_space_enum", 200_000))
+                sample_n = int(info.get("sample_n", 10_000))
+                history_raw = info.get("history", [])
+                history = [
+                    (list(item[0]) if not isinstance(item, dict) else list(item["guess"]),
+                     (int(item[1][0]) if not isinstance(item, dict) else int(item["feedback"][0]),
+                      int(item[1][1]) if not isinstance(item, dict) else int(item["feedback"][1])))
+                    for item in history_raw
+                ]
+                ok, guess = _parse_guess_from_text(ans_text, L=L, K=K, repeats=repeats)
+                if not ok:
+                    val = -1.0
+                else:
+                    cfg_local = MastermindConfig(
+                        L=L, K=K, allow_repeats=repeats, reward_mode=reward_mode,
+                        max_space_enum=max_space_enum, sample_n=sample_n, history_len=0,
+                    )
+                    val, _ = _compute_reward_for_guess(guess, cfg_local, history, rng=random.Random(43))
+                log_path = str(info.get("curriculum_log", cur_log_path))
+                run_id = str(info.get("curriculum_run_id", curriculum_run_id or ""))
+                try:
+                    if log_path:
+                        with open(log_path, "a", encoding="utf-8") as f:
+                            f.write(json.dumps({
+                                "type": "reward",
+                                "ts": time.time(),
+                                "run_id": run_id,
+                                "reward": float(val),
+                            }) + "\n")
+                except Exception:
+                    pass
+                return 0.0
+
+            rubric.add_reward_func(curriculum_log_reward, weight=0.0)
 
         env = vf.SingleTurnEnv(
             dataset=dataset,

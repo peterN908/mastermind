@@ -12,3 +12,9 @@ __pycache__/
 
 # Project outputs
 outputs/
+
+# Analysis outputs
+analysis/outputs/
+
+
+.DS_Store
