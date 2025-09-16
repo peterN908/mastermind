@@ -645,7 +645,9 @@ def load_environment(**kwargs) -> vf.Environment:
 
         # Strict format reward (light weight)
         format_reward_fn = parser.get_format_reward_func()
-        rubric.add_reward_func(lambda completion, **__: float(format_reward_fn(completion)), weight=0.05)  # type: ignore
+        def format_reward(completion, **__):  # type: ignore
+            return float(format_reward_fn(completion))
+        rubric.add_reward_func(format_reward, weight=0.05)
 
         # Expose size of S_H as a diagnostic metric
         async def sh_size_metric(parser, completion, info: Dict[str, Any], **_):  # type: ignore
@@ -739,8 +741,6 @@ def load_environment(**kwargs) -> vf.Environment:
             K: int = state["K"]
             repeats: bool = state["repeats"]
             hidden: List[int] = state["hidden"]
-            # get last assistant content
-            last_assistant = [m for m in messages if m.get("role") == "assistant"][-1]
             try:
                 ans_text = (parser.parse_answer(messages) or "").strip()
             except Exception:
@@ -805,7 +805,9 @@ def load_environment(**kwargs) -> vf.Environment:
 
     # Format reward (ensure model sends proper tags each turn)
     format_reward_fn = parser.get_format_reward_func()
-    rubric.add_reward_func(lambda completion, **__: float(format_reward_fn(completion)), weight=0.05)  # type: ignore
+    def format_reward(completion, **__):  # type: ignore
+        return float(format_reward_fn(completion))
+    rubric.add_reward_func(format_reward, weight=0.05)
 
     env = MastermindSolveEnv(
         dataset=dataset,

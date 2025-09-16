@@ -4,7 +4,7 @@ Evaluate single-turn Mastermind (ig_relative) over a grid of (L, K, history_len)
 and save results (CSV/JSON). Optionally plot heatmaps per history level.
 
 Defaults:
-- Model: gpt-5-nano
+- Model: gpt-4.1-nano
 - Grid: L=3..7, K=3..9, history_len=0..5
 - N=10, r=1, reward_mode=ig_relative, curriculum=False
 
@@ -24,7 +24,7 @@ import statistics
 import time
 from typing import Any, Dict, List, Tuple
 
-from openai import OpenAI, AsyncOpenAI
+from openai import AsyncOpenAI
 import asyncio
 
 
@@ -48,46 +48,7 @@ def _load_mm_module():
     return mm
 
 
-async def aevaluate_config(mm, aclient: AsyncOpenAI, model: str, L: int, K: int, H: int, n: int, r: int,
-                           toks: int, temp: float, allow_repeats: bool = True, seed: int | None = None) -> Dict[str, Any]:
-    env_args: Dict[str, Any] = {
-        "mode": "single",
-        "L": L,
-        "K": K,
-        "allow_repeats": allow_repeats,
-        "reward_mode": "ig_relative",
-        "history_len": H,
-        "curriculum": False,
-        "max_examples": n,
-    }
-    if seed is not None:
-        env_args["seed"] = seed
-    env = mm.load_environment(env_args=env_args)
-    results = await env.a_generate(
-        inputs=env.get_dataset(n=n),
-        client=aclient,
-        model=model,
-        sampling_args={"max_tokens": toks, "temperature": temp},
-        score_rollouts=True,
-    )
-    rewards = results.reward or []
-    ig_rel = results.metrics.get("mastermind_reward", []) or []
-    fmt = results.metrics.get("<lambda>", []) or []
-    val_mask = [f >= 0.99 for f in fmt]
-    ig_valid = [v for v, ok in zip(ig_rel, val_mask) if ok]
-    rec = {
-        "L": L,
-        "K": K,
-        "history_len": H,
-        "avg_reward": float(statistics.fmean(rewards)) if rewards else 0.0,
-        "avg_ig_relative": float(statistics.fmean(ig_rel)) if ig_rel else 0.0,
-        "avg_ig_relative_valid": float(statistics.fmean(ig_valid)) if ig_valid else 0.0,
-        "valid_rate": float(sum(val_mask)) / float(len(val_mask)) if val_mask else 0.0,
-        "avg_format": float(statistics.fmean(fmt)) if fmt else 0.0,
-        "n": n,
-        "r": r,
-    }
-    return rec
+# (removed unused helper aevaluate_config)
 
 
 def main(argv: List[str] | None = None) -> int:
@@ -105,7 +66,7 @@ def main(argv: List[str] | None = None) -> int:
     ap.add_argument("--H-max", type=int, default=5)
     ap.add_argument("--no-repeats", action="store_true", help="Disallow repeated symbols")
     ap.add_argument("--seed", type=int, default=None)
-    ap.add_argument("--out-dir", type=str, default=os.path.join("environments", "mastermind", "analysis", "outputs"))
+    ap.add_argument("--out-dir", type=str, default=os.path.join(os.path.dirname(__file__), "outputs"))
     ap.add_argument("--save-completions", action="store_true", help="Save raw prompts/completions per config as JSONL")
     ap.add_argument("--completions-dir", type=str, default="", help="Directory to save completions (defaults to out-dir/completions/<stamp>)")
     ap.add_argument("--no-plot", action="store_true", help="Skip plotting even if matplotlib is available")
@@ -161,7 +122,7 @@ def main(argv: List[str] | None = None) -> int:
                     # Aggregate
                     rewards = results.reward or []
                     ig_rel = results.metrics.get("mastermind_reward", []) or []
-                    fmt = results.metrics.get("<lambda>", []) or []
+                    fmt = results.metrics.get("format_reward", []) or []
                     import statistics as _stats
                     rec = {
                         "L": L,
